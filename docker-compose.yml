@@ -1,0 +1,7 @@
+services:
+  transit-planner:
+    build: .
+    container_name: transit-planner
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
