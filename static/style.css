@@ -205,6 +205,7 @@ textarea.stops {
 .leg .when { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .leg .what { font-weight: 600; margin: 1px 0; }
 .leg .meta { color: var(--muted); font-size: 12px; }
+.leg .meta.trunc { color: var(--warn); margin-top: 2px; }
 .leg.ride .what { color: var(--ride); }
 .leg.walk .what { color: var(--walk); }
 .leg.wait { opacity: .85; }
