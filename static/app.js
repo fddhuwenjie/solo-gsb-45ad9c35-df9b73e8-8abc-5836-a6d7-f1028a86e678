@@ -118,13 +118,16 @@ function renderSuspensions() {
           "类型",
           `<select data-f="kind">
              <option value="station">站点停运</option>
-             <option value="route">线路停运</option>
+             <option value="route">线路停运（整班）</option>
+             <option value="segment">线路局部停运（站段）</option>
            </select>`
         )}
         ${fieldHtml("站点", `<select class="w-station" data-f="stationRef">${stationOptions()}</select>`)}
         ${fieldHtml("线路名（或选择）",
           `<input class="w-name" list="route-list" data-f="routeRef" value="" placeholder="如 2路" />
            <datalist id="route-list">${routeOptions()}</datalist>`)}
+        ${fieldHtml("封锁起点站", `<select class="w-station" data-f="segFrom">${stationOptions()}</select>`)}
+        ${fieldHtml("封锁终点站", `<select class="w-station" data-f="segTo">${stationOptions()}</select>`)}
         ${fieldHtml("开始", `<input class="w-time" type="time" data-f="start" value="${esc(x.start)}" />`)}
         ${fieldHtml("结束", `<input class="w-time" type="time" data-f="end" value="${esc(x.end)}" />`)}
         ${fieldHtml("备注", `<input style="width:150px" data-f="label" value="${esc(x.label || "")}" />`)}
@@ -139,7 +142,12 @@ function renderSuspensions() {
     if (x.kind === "station") {
       row.querySelector('[data-f="stationRef"]').value = x.ref;
     } else {
-      row.querySelector('[data-f="routeRef"]').value = x.ref;
+      // 线路名兼容旧字段 route
+      row.querySelector('[data-f="routeRef"]').value = x.ref || x.route || "";
+    }
+    if (x.kind === "segment") {
+      if (x.from) row.querySelector('[data-f="segFrom"]').value = x.from;
+      if (x.to) row.querySelector('[data-f="segTo"]').value = x.to;
     }
     applySuspKind(row);
   });
@@ -150,7 +158,12 @@ function applySuspKind(row) {
   row.querySelector('[data-f="stationRef"]').parentElement.style.display =
     kind === "station" ? "" : "none";
   row.querySelector('[data-f="routeRef"]').parentElement.style.display =
-    kind === "route" ? "" : "none";
+    kind === "route" || kind === "segment" ? "" : "none";
+  const showSeg = kind === "segment";
+  for (const f of ["segFrom", "segTo"]) {
+    row.querySelector(`[data-f="${f}"]`).parentElement.style.display =
+      showSeg ? "" : "none";
+  }
 }
 
 function renderAll() {
@@ -205,13 +218,25 @@ function readRow(row) {
     };
   } else if (k === "suspensions") {
     const kind = get("kind").value;
-    data.suspensions[i] = {
-      kind,
-      ref: kind === "station" ? get("stationRef").value : get("routeRef").value.trim(),
-      start: get("start").value || "00:00",
-      end: get("end").value || "23:59",
-      label: get("label").value.trim(),
-    };
+    // 保留旧记录上已有的字段（如局部停运的 from/to、导入时附带的额外字段），
+    // 切换类型与编辑时都不丢失
+    const prev = data.suspensions[i] || {};
+    const base = { ...prev, kind };
+    if (kind === "station") {
+      base.ref = get("stationRef").value;
+    } else {
+      base.ref = get("routeRef").value.trim();
+      // 兼容仍以 route 存线路名的旧数据
+      if (prev.route && !base.ref) base.route = prev.route;
+    }
+    if (kind === "segment") {
+      base.from = get("segFrom").value;
+      base.to = get("segTo").value;
+    }
+    base.start = get("start").value || "00:00";
+    base.end = get("end").value || "23:59";
+    base.label = get("label").value.trim();
+    data.suspensions[i] = base;
   }
 }
 
@@ -379,11 +404,16 @@ function renderResult(res) {
           <div class="meta">步行 ${l.minutes} 分钟后于 ${hhmm(l.arrive)} 到达邻站方可乘车</div>
         </li>`;
       }
+      const seg = l.segment;
+      const cutBadge = l.truncated && seg
+        ? `<div class="meta trunc-note">⛔ 乘车段在此截断：${esc(seg.route)} ${esc(sname(seg.from))}→${esc(sname(seg.to))} 站段 ${hhmm(seg.window?.start)}–${hhmm(seg.window?.end)} 封闭${seg.window?.label ? `（${esc(seg.window.label)}）` : ""}，不穿越封锁，请在此下车后步行或换乘其他班次</div>`
+        : "";
       return `<li class="leg ride">
         <span class="dot">乘</span>
         <div class="when">${hhmm(l.depart)} 发车 · ${hhmm(l.arrive)} 到达（${l.minutes} 分钟）</div>
         <div class="what">${esc(l.route)} · 班次 ${esc(l.trip_id)}</div>
         <div class="meta">${esc(sname(l.from))} 上车 → ${esc(sname(l.to))} 下车</div>
+        ${cutBadge}
       </li>`;
     })
     .join("");
@@ -405,7 +435,7 @@ async function loadSample() {
   renderAll();
   els.earliest.value = "08:00";
   els.preference.value = "fastest";
-  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 2 条停运），点击「规划行程」。</p>`;
+  els.result.innerHTML = `<p class="empty">示例数据已载入（含 8 个站点、5 个班次与 3 条停运，其中 2 路含早高峰局部停运站段），点击「规划行程」。</p>`;
   els.recalc.hidden = true;
 }
 
@@ -435,6 +465,7 @@ els.fileImport.addEventListener("change", async (ev) => {
   if (!file) return;
   try {
     const parsed = JSON.parse(await file.text());
+    // 各列表原样保留记录字段（局部停运的 from/to、历史 route 字段等都不丢失）
     data = {
       stations: parsed.stations || [],
       trips: parsed.trips || [],

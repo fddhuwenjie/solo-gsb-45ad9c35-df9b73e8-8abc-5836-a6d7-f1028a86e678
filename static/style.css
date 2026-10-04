@@ -208,6 +208,12 @@ textarea.stops {
 .leg.ride .what { color: var(--ride); }
 .leg.walk .what { color: var(--walk); }
 .leg.wait { opacity: .85; }
+.leg .trunc-note {
+  margin-top: 4px;
+  color: var(--warn);
+  border-left: 2px solid var(--warn);
+  padding-left: 8px;
+}
 
 .blocked {
   border: 1px solid rgba(248, 113, 113, .5);

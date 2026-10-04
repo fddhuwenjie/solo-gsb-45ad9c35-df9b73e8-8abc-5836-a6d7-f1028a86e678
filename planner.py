@@ -4,8 +4,10 @@
 - 站点为节点；
 - 每个班次按发车时刻依次经停若干站点，只有在不早于到达时刻才能在该站上车；
 - 站点之间可配置站内/站间步行换乘边（双向），换乘必须先走完步行时间；
-- 临时停运分两类：站点停运（某站在时间窗内不能上/下车，班次只能跳站通过）与
-  线路停运（时间窗内发车的班次整个班次被跳过）。
+- 临时停运分三类：站点停运（某站在时间窗内不能上/下车，班次只能跳站通过）、
+  线路停运（时间窗内发车的班次整个班次被跳过）与线路局部停运（指定线路按经停顺序
+  的某一站段在时间窗内封闭，班次不整班删除，只在封锁站段之前截断：封锁前各站仍可
+  下车、封锁终点及以后各站仍可上车，区间内既不能上也不能下，不得穿越封锁站段）。
 
 搜索采用多标签时间依赖 Dijkstra，标签按所选偏好对应的三元组做帕累托支配剪枝；
 无解时汇总搜索过程中遇到的全部阻塞约束，返回时间最早的一个。
@@ -183,20 +185,65 @@ def normalize(data: dict) -> dict:
         s: [] for s in stations
     }
     route_windows: dict[str, list[tuple[int, int, str | None]]] = {}
+    # 线路局部停运：班次 -> [(from下标, to下标, start, end, label, from站, to站, 线路)]
+    trip_segments: dict[str, list[tuple]] = {}
+    # 线路名 -> 班次列表，供局部停运校验站段归属
+    trips_by_route: dict[str, list[dict]] = {}
+    for trip in trips:
+        trips_by_route.setdefault(trip["route"], []).append(trip)
+
     for i, item in enumerate(raw_susp):
         if not isinstance(item, dict):
             raise PlanError(f"停运记录 #{i + 1} 格式不合法")
         kind = str(item.get("kind", "")).strip()
+        # ref 为标准字段；历史/外部数据可能把线路名放在 route 字段，两者都接受
         ref = str(item.get("ref", "")).strip()
+        if not ref:
+            ref = str(item.get("route", "")).strip()
         label = item.get("label")
+        seg_from = seg_to = ""
         if kind == "station":
             if ref not in seen:
                 raise PlanError(f"停运记录 #{i + 1} 引用了不存在的站点：{ref}")
-        elif kind == "route":
+        elif kind in ("route", "segment"):
             if not ref:
                 raise PlanError(f"停运记录 #{i + 1} 缺少线路名")
         else:
-            raise PlanError(f"停运记录 #{i + 1} 类型必须是 station 或 route")
+            raise PlanError(
+                f"停运记录 #{i + 1} 类型必须是 station / route / segment"
+            )
+        if kind == "segment":
+            seg_from = str(item.get("from", "")).strip()
+            seg_to = str(item.get("to", "")).strip()
+            if not seg_from or not seg_to:
+                raise PlanError(
+                    f"停运记录 #{i + 1}（线路 {ref} 局部停运）必须填写经停顺序中的"
+                    "起止站点"
+                )
+            if seg_from not in seen:
+                raise PlanError(
+                    f"停运记录 #{i + 1}（{ref}）引用了不存在的站点：{seg_from}"
+                )
+            if seg_to not in seen:
+                raise PlanError(
+                    f"停运记录 #{i + 1}（{ref}）引用了不存在的站点：{seg_to}"
+                )
+            if seg_from == seg_to:
+                raise PlanError(
+                    f"停运记录 #{i + 1}（{ref}）的起止站点相同：{seg_from}"
+                )
+            route_trips = trips_by_route.get(ref, ())
+            matched: list[tuple[dict, int, int]] = []
+            for trip in route_trips:
+                pos = {stop["station"]: k for k, stop in enumerate(trip["stops"])}
+                if seg_from in pos and seg_to in pos \
+                        and pos[seg_from] < pos[seg_to]:
+                    matched.append((trip, pos[seg_from], pos[seg_to]))
+            if not matched:
+                raise PlanError(
+                    f"停运记录 #{i + 1}：线路 {ref} 没有班次按经停顺序同时经过 "
+                    f"{seg_from} 与 {seg_to}，无法定义局部停运站段"
+                )
         start = parse_time(item.get("start"), f"停运记录 #{i + 1} 开始")
         end = parse_time(item.get("end"), f"停运记录 #{i + 1} 结束")
         if end <= start:
@@ -204,8 +251,18 @@ def normalize(data: dict) -> dict:
         window = (start, end, str(label) if label else None)
         if kind == "station":
             station_windows[ref].append(window)
-        else:
+        elif kind == "route":
             route_windows.setdefault(ref, []).append(window)
+        else:
+            for trip, p_from, p_to in matched:
+                trip_segments.setdefault(trip["id"], []).append(
+                    (p_from, p_to, start, end,
+                     str(label) if label else None, seg_from, seg_to, ref))
+
+    # 局部停运站段按（from 下标, to 下标, 窗口起点, 窗口终点）排序，保证多段重叠时
+    # 归因与截断稳定可复现
+    for tid in trip_segments:
+        trip_segments[tid].sort(key=lambda s: (s[0], s[1], s[2], s[3]))
 
     # 站点 -> 可乘坐的 (班次, 经停下标)，按到站时刻排序
     departures: dict[str, list[tuple[str, int]]] = {s: [] for s in stations}
@@ -227,6 +284,7 @@ def normalize(data: dict) -> dict:
         "departures": departures,
         "station_windows": station_windows,
         "route_windows": route_windows,
+        "trip_segments": trip_segments,
     }
 
 
@@ -274,7 +332,7 @@ SAMPLE_DATA: dict = {
     "transfers": [
         {"from": "S2", "to": "S1", "minutes": 4},
         {"from": "S4", "to": "S5", "minutes": 7},
-        {"from": "S3", "to": "S6", "minutes": 12},
+        {"from": "S3", "to": "S6", "minutes": 30},
     ],
     "suspensions": [
         # 示例：临江道口当日全天封站，途经班次须跳站通过（仍可乘到西城枢纽）
@@ -283,6 +341,11 @@ SAMPLE_DATA: dict = {
         # 示例：3 路午间区间停运
         {"kind": "route", "ref": "3路", "start": "12:00", "end": "13:00",
          "label": "3路午间停运"},
+        # 示例：2 路早高峰人民广场→火车北站 站段封闭，班次只截到封锁前各站，
+        # 不得穿越；下车步行或换乘 3 路继续
+        {"kind": "segment", "ref": "2路", "from": "S4", "to": "S6",
+         "start": "08:00", "end": "09:30",
+         "label": "人民广场路口施工，2路区间甩段"},
     ],
 }
 
@@ -309,6 +372,40 @@ class Planner:
             if start <= when <= end:
                 return False, {"start": start, "end": end, "label": label}
         return True, None
+
+    def segment_for_board(self, trip_id: str, idx: int,
+                          when: int) -> tuple | None:
+        """在经停下标 idx、时刻 when 上车时，禁止上车的局部停运站段（区间内上车）。
+
+        封锁区间内部为下标 [p_from, p_to)：终点站 p_to 属于区间外，仍可上车。
+        """
+        for seg in self.n["trip_segments"].get(trip_id, ()):
+            p_from, p_to, start, end, label, s_from, s_to, route = seg
+            if p_from <= idx < p_to and start <= when <= end:
+                return seg
+        return None
+
+    def segment_cut(self, trip_id: str, idx: int, dep: int) -> tuple | None:
+        """从下标 idx 上车（时刻 dep）后，第一个截断本班次的局部停运站段。
+
+        班次穿过站段的时间窗 [到达 p_from, 到达 p_to] 与停运窗（含边界）重叠，
+        且上车点在 p_from 之前时，本班在 p_from 处截断：不能穿越，只能在 p_from
+        及之前下车；p_to 及以后属于区间外，另从其后方站上车不受影响。
+        """
+        stops = self.n["trips"][trip_id]["stops"]
+        best = None
+        for seg in self.n["trip_segments"].get(trip_id, ()):
+            p_from, p_to, start, end, label, s_from, s_to, route = seg
+            if p_from <= idx:
+                continue  # 上车点不在封锁站段之前（区间内上车另有拦截）
+            t_from = stops[p_from]["time"]
+            t_to = stops[p_to]["time"]
+            # 穿越时间窗 [t_from, t_to] 与停运窗 [start, end] 含边界重叠即截断
+            if t_from <= end and start <= t_to:
+                if best is None or (p_from, p_to, start, end) < (
+                        best[0], best[1], best[2], best[3]):
+                    best = seg
+        return best
 
     @staticmethod
     def _window_text(window: dict | None) -> str:
@@ -352,7 +449,8 @@ class Planner:
         def record(blocker: dict) -> None:
             key = (blocker["kind"], blocker.get("action"),
                    blocker.get("station"), blocker.get("time"),
-                   blocker.get("trip_id"))
+                   blocker.get("trip_id"), blocker.get("route"),
+                   blocker.get("seg_from"), blocker.get("seg_to"))
             blockers.setdefault(key, blocker)
 
         order = PREFERENCE_FIELDS[preference]
@@ -475,10 +573,87 @@ class Planner:
                     })
                     continue
 
-                # 延伸到后续每个（到站时开放的）经停站；停运站跳站通过
+                # 上车点正处于某条局部停运站段的封锁区间内：不能上车（区间外仍可用）
+                seg_here = self.segment_for_board(trip_id, idx, dep)
+                if seg_here:
+                    _, _, seg_start, seg_end, seg_label, sf, st, sroute = seg_here
+                    record({
+                        "kind": "segment_suspended", "action": "board",
+                        "station": station, "time": dep,
+                        "trip_id": trip_id, "route": sroute,
+                        "seg_from": sf, "seg_to": st,
+                        "window": {"start": seg_start, "end": seg_end,
+                                   "label": seg_label},
+                        "message": (
+                            f"拟于 {to_hhmm(dep)} 在 {self.sname(station)} 乘坐班次 "
+                            f"{trip_id}（{sroute}），但该站处于线路局部停运站段 "
+                            f"{self.sname(sf)}→{self.sname(st)} 的"
+                            f"{self._window_text({'start': seg_start, 'end': seg_end, 'label': seg_label})}"
+                            "区间内，不能上车；封锁站段终点之后各站仍可上车。"
+                        ),
+                    })
+                    continue
+
+                # 本班次是否在前方被某条局部停运站段截断（不删整班）
+                cut = self.segment_cut(trip_id, idx, dep)
+                cut_idx = cut[0] if cut else -1
+
+                # 延伸到后续每个（到站时开放的）经停站；停运站跳站通过；
+                # 遇到局部停运站段的起点即截断：只保留封锁前能下车的乘段，不穿越
                 for j in range(idx + 1, len(trip["stops"])):
                     target = trip["stops"][j]["station"]
                     arrive_at = trip["stops"][j]["time"]
+
+                    if cut is not None and j == cut_idx:
+                        _, _, c_start, c_end, c_label, c_sf, c_st, c_route = cut
+                        win_cut = {"start": c_start, "end": c_end,
+                                   "label": c_label}
+                        # 封锁起点站本身能否下车，仍受站点停运约束
+                        open_cut, win_alight = self.station_open(target,
+                                                                 arrive_at)
+                        if open_cut:
+                            try_extend(
+                                label, target, arrive_at, label["rides"] + 1,
+                                label["walk"], trip_id,
+                                {"type": "ride", "trip_id": trip_id,
+                                 "route": trip["route"], "from": station,
+                                 "to": target, "depart": dep,
+                                 "arrive": arrive_at,
+                                 "minutes": arrive_at - dep,
+                                 "truncated": True,
+                                 "segment": {"route": c_route,
+                                             "from": c_sf, "to": c_st,
+                                             "window": win_cut}})
+                        else:
+                            record({
+                                "kind": "station_closed", "action": "alight",
+                                "station": target, "time": arrive_at,
+                                "trip_id": trip_id, "window": win_alight,
+                                "message": (
+                                    f"班次 {trip_id}（{trip['route']}）于 "
+                                    f"{to_hhmm(arrive_at)} 到达 {self.sname(target)}，"
+                                    f"该站正处于临时停运时段"
+                                    f"{self._window_text(win_alight)}，班次跳站通过，"
+                                    "不能下车。"
+                                ),
+                            })
+                        record({
+                            "kind": "segment_suspended", "action": "cross",
+                            "station": target, "time": arrive_at,
+                            "trip_id": trip_id, "route": c_route,
+                            "seg_from": c_sf, "seg_to": c_st,
+                            "window": win_cut,
+                            "message": (
+                                f"班次 {trip_id}（{c_route}）在 {to_hhmm(arrive_at)} "
+                                f"到达 {self.sname(c_sf)} 后进入局部停运站段 "
+                                f"{self.sname(c_sf)}→{self.sname(c_st)}（"
+                                f"{self._window_text(win_cut)}），乘车段在此截断，"
+                                "不能穿越封锁；请在封锁前各站下车，改由步行或其他班次"
+                                "继续，封锁终点之后各站仍可乘车。"
+                            ),
+                        })
+                        break  # 封锁站段及以后不再由本班继续
+
                     open_alight, win_alight = self.station_open(target, arrive_at)
                     if not open_alight:
                         record({
@@ -551,11 +726,17 @@ class Planner:
                 "message": f"终点站 {self.sname(destination)} 没有任何经停班次，无法到达。",
             }
         if items:
-            kind_rank = {"origin_closed": 0, "station_closed": 1,
-                         "route_suspended": 2, "no_service_after": 3}
+            # 先按事件发生时刻（最早为先）；同一时刻优先归因到具体线路站段
+            # （segment_suspended），再按线路、站段、站点、班次稳定加细排序，
+            # 保证同一输入下首个阻塞约束可复现
+            kind_rank = {"origin_closed": 0, "segment_suspended": 1,
+                         "station_closed": 2, "route_suspended": 3,
+                         "no_service_after": 4}
             first = min(items, key=lambda b: (
-                b.get("time", earliest), str(b.get("station", "")),
-                str(b.get("trip_id", "")), kind_rank.get(b["kind"], 9)))
+                b.get("time", earliest), kind_rank.get(b["kind"], 9),
+                str(b.get("route", "")),
+                str(b.get("seg_from", "")), str(b.get("seg_to", "")),
+                str(b.get("station", "")), str(b.get("trip_id", ""))))
             return first
         return {
             "kind": "unreachable", "action": "end", "station": destination,

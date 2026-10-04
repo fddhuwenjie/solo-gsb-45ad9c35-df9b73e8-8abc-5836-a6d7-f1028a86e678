@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="topbar-inner">
       <h1>🚌 公交时刻换乘规划台</h1>
-      <p class="subtitle">时间依赖图搜索 · 步行换乘约束 · 临时停运跳站 · 字典序稳定取解</p>
+      <p class="subtitle">时间依赖图搜索 · 步行换乘约束 · 临时停运跳站与线路区间截断 · 字典序稳定取解</p>
     </div>
   </header>
 
@@ -55,7 +55,7 @@
       <div class="card">
         <div class="card-head">
           <h2>④ 临时停运区间</h2>
-          <span class="hint">站点停运＝该时段跳站通过；线路停运＝跳过整个班次</span>
+          <span class="hint">站点停运＝跳站通过；线路停运＝跳过整班；线路局部停运＝按经停顺序封闭站段，班次截到封锁前、不穿越</span>
         </div>
         <div id="suspensions-list" class="rows"></div>
         <button class="add" data-add="suspension" type="button">＋ 添加停运区间</button>

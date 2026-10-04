@@ -35,9 +35,14 @@ python app.py
 2. **线路班次**：班次 ID、线路名与逐站经停时刻（每行 `站点ID HH:MM`，时刻须严格递增）。
    每个班次即一趟车，只可在不早于到站时刻的车站上车，沿停站顺序单向乘坐。
 3. **步行换乘**：两站间步行分钟数，双向生效；换乘时必须先走完该步行时间才能在邻站乘车。
-4. **临时停运区间**：
+4. **临时停运区间**（三种，可混用）：
    - **站点停运**：时间窗内该站不能上、下车，途经班次自动**跳站通过**；
-   - **线路停运**：时间窗内发车的该线路**整个班次被跳过**。
+   - **线路停运**：时间窗内发车的该线路**整个班次被跳过**；
+   - **线路局部停运（站段）**：填写线路名与该线路**经停顺序中的起点站、终点站**及时段。
+     班次穿过该站段的时刻（到达起点站→到达终点站）与停运窗（含边界）重叠时，
+     **不整班删除，也不得穿越封锁**：只保留封锁前能下车的乘车段（可在起点站下车，
+     前提是该站未被站点停运），后续由步行或其他班次继续；封锁区间内部各站既不能上、
+     也不能下；**封锁终点站及其之后各站仍可正常上车**，封锁起点站之前各站仍可下车。
 
 在「⑤ 行程规划」中选择起点、终点、最早出发时刻与偏好后点击 **规划行程**。
 **修改任何输入后可再次点击直接重算**，页面会提示“结果待重算”。
@@ -62,9 +67,13 @@ python app.py
 
 - 起点站在出发时刻即处于停运时段，无法出发；
 - 某班次被线路停运区间覆盖，整班被跳过；
+- 拟在局部停运站段的封锁区间内部上车，或班次在封锁起点处被截断、不能穿越；
 - 步行到达邻站时该站恰好封站，不能进入换乘；
 - 班次到达某站时该站封站，只能跳站通过；
 - 最早出发时刻之后已无班次，或起终点之间不存在连通路径。
+
+截断的乘车段会在结果时间线以 ⛔ 标记，注明被封锁的线路、站段与时间窗；
+时间线其余部分（等 / 走 / 乘）保持原有结构。
 
 结果区逐段（`等 / 走 / 乘`）展示时间线：站内候车区间、步行换乘起讫与耗时、
 每个班次的线路、班次号、上/下车站点及发车、到达时刻。
@@ -86,19 +95,90 @@ python app.py
     "trips": [{"id": "K1", "route": "1路",
                "stops": [{"station": "S1", "time": "08:05"}]}],
     "transfers": [{"from": "S2", "to": "S1", "minutes": 4}],
-    "suspensions": [{"kind": "station", "ref": "S7",
-                     "start": "00:00", "end": "23:59", "label": "施工封站"}]
+    "suspensions": [
+      {"kind": "station", "ref": "S7",
+       "start": "00:00", "end": "23:59", "label": "施工封站"},
+      {"kind": "segment", "ref": "2路", "from": "S4", "to": "S6",
+       "start": "08:00", "end": "09:30", "label": "区间甩段"}
+    ]
   }
 }
 ```
 
 `preference` 取值：`fastest` / `transfers` / `walking`；
-停运 `kind` 取值：`station`（`ref` 为站点 ID）/ `route`（`ref` 为线路名）。
+停运 `kind` 取值：
+
+| kind | 含义 | 必填字段 |
+|---|---|---|
+| `station` | 站点停运（跳站通过） | `ref`＝站点 ID |
+| `route` | 线路停运（跳过整班） | `ref`＝线路名 |
+| `segment` | 线路局部停运（站段截断） | `ref`＝线路名、`from`/`to`＝该线路经停顺序中的起止站点 |
+
+三类停运都含 `start` / `end`（`HH:MM`，结束必须晚于开始）与可选 `label`。
+`segment` 的线路名也兼容写在 `route` 字段；`from`/`to` 两站必须存在，且该线路
+至少有一个班次按顺序同时经过两站，否则返回 400。
 时间均为当日 `HH:MM`，不含跨夜班次。
 
-成功返回 `{"status": "ok", "itinerary": {...}}`，
-无解返回 `{"status": "blocked", "blocker": {"message": "首个阻塞约束…"}}`，
+成功返回 `{"status": "ok", "itinerary": {...}}`；成功行程中被截断的乘车段
+（`type: "ride"`）会额外带 `"truncated": true` 与
+`"segment": {"route", "from", "to", "window": {"start","end","label"}}`，
+其余字段与既有响应一致。
+无解返回 `{"status": "blocked", "blocker": {...}}`，局部停运导致的首个阻塞约束
+`kind` 为 `segment_suspended`，并带 `route`、`seg_from`、`seg_to` 指向实际线路站段；
 输入不合法返回 HTTP 400 与 `{"status": "error", "message": "..."}`。
+
+### 调用示例（curl）
+
+```bash
+# 线路局部停运：2路 S4->S6 早高峰封锁，班次只能截到 S4，再步行或换乘
+curl -s http://localhost:8000/api/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": {"origin": "S1", "destination": "S6",
+              "earliest": "08:00", "preference": "fastest"},
+    "data": {
+      "stations": [{"id": "S1"}, {"id": "S4"}, {"id": "S6"}],
+      "trips": [
+        {"id": "K2", "route": "2路", "stops": [
+          {"station": "S1", "time": "08:08"},
+          {"station": "S4", "time": "08:25"},
+          {"station": "S6", "time": "08:35"}]},
+        {"id": "K3", "route": "3路", "stops": [
+          {"station": "S4", "time": "08:45"},
+          {"station": "S6", "time": "08:52"}]}
+      ],
+      "transfers": [],
+      "suspensions": [
+        {"kind": "segment", "ref": "2路", "from": "S4", "to": "S6",
+         "start": "08:00", "end": "09:30", "label": "路口施工"}
+      ]
+    }
+  }'
+```
+
+成功响应（节选；`K2` 乘段在 `S4` 截断，换乘 `K3` 继续，未穿越封锁站段）：
+
+```json
+{
+  "status": "ok",
+  "itinerary": {
+    "arrival": 532, "rides": 2, "transfers": 1,
+    "legs": [
+      {"type": "ride", "trip_id": "K2", "route": "2路",
+       "from": "S1", "to": "S4", "depart": 488, "arrive": 505,
+       "minutes": 17, "truncated": true,
+       "segment": {"route": "2路", "from": "S4", "to": "S6",
+                   "window": {"start": 480, "end": 570, "label": "路口施工"}}},
+      {"type": "ride", "trip_id": "K3", "route": "3路",
+       "from": "S4", "to": "S6", "depart": 525, "arrive": 532, "minutes": 7}
+    ]
+  }
+}
+```
+
+若截断后既无步行也无其他班次可继续，则返回
+`{"status": "blocked", "blocker": {"kind": "segment_suspended", ...}}`，
+消息具体指出是哪条线路的哪个站段在何时截断。
 
 ## 目录结构
 
